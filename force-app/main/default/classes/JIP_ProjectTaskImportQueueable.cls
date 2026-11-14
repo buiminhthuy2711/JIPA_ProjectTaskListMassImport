@@ -34,7 +34,7 @@ public class JIP_ProjectTaskImportQueueable implements Queueable{
     private static final String STATUS_TEMPLATE_NOT_FOUND = 'Template Not Found';
 
     // Define the email template names for success and error notifications
-    private static final String TEMPLATE_COMPLETION = 'Mass_Import_Success';
+    private static final String TEMPLATE_COMPLETION = 'Mass_Import_Completion';
     private static final String TEMPLATE_ERROR = 'Mass_Import_Error';
 
     // Define the error message for missing email template
@@ -66,14 +66,8 @@ public class JIP_ProjectTaskImportQueueable implements Queueable{
             WHERE Id = :contentVersionId 
             LIMIT 1
         ];
-
-        // 1. Check if ContentVersion exists and has data
-        if (cv == null || cv.VersionData == null) {
-            failImport(cv, 'ContentVersion not found or has no data.');
-            return;
-        }
         
-        // 2. Get record limit configuration
+        // 1. Get record limit configuration
         try {
             recordLimitPerImport = Integer.valueOf(
                 System.Label.Project_Task_Import_Record_Limit.trim()
@@ -87,7 +81,7 @@ public class JIP_ProjectTaskImportQueueable implements Queueable{
             return;
         }
 
-        // 3. Parse CSV content into structured rows (BOM, CRLF, quoted commas/newlines handled)
+        // 2. Parse CSV content into structured rows (BOM, CRLF, quoted commas/newlines handled)
         List<CsvRow> parsedRows;
         try {
             parsedRows = parseCsv(cv.VersionData.toString());
@@ -105,7 +99,7 @@ public class JIP_ProjectTaskImportQueueable implements Queueable{
             }
         }
 
-        // 4. Validate CSV header
+        // 3. Validate CSV header
         if (nonEmptyRows.isEmpty()) {
             failImport(cv, 'CSV is empty. Header row is missing.');
             return;
@@ -135,23 +129,19 @@ public class JIP_ProjectTaskImportQueueable implements Queueable{
             return;
         }
 
-        // 5. Check record limit
+        // 4. Check record limit
         if (dataRows.size() > recordLimitPerImport) {
             failImport(cv, 'CSV file exceeds the maximum allowed records of ' + recordLimitPerImport + '. Found: ' + dataRows.size());
             return;
         }
 
         
-        // 6. Collect all unique worker codes from the CSV
+        // 5. Collect all unique worker codes from the CSV
         Set<String> workerCodes = new Set<String>();
+        // Trim and add the worker code in the Assignee column to the set if it's not blank
         for(CsvRow row : dataRows) {
             List<String> csvColumns = row.columns;
-            if (csvColumns.size() != REQUIRED_HEADERS.size()) {
-                failImport(cv, 'Invalid number of columns at Row ' + row.lineNumber + '. Expected: ' + REQUIRED_HEADERS.size() + ', Found: ' + csvColumns.size());
-                continue;
-            }
-            // Trim and add the worker code in the Assignee column to the set if it's not blank
-            if(String.isNotBlank(csvColumns[COL_ASSIGNEE])) {
+            if(csvColumns.size() == REQUIRED_HEADERS.size() && String.isNotBlank(csvColumns[COL_ASSIGNEE])) {
                 workerCodes.add(csvColumns[COL_ASSIGNEE].trim());
             }
         }
@@ -169,7 +159,7 @@ public class JIP_ProjectTaskImportQueueable implements Queueable{
             }
         }
 
-        // 7. Create ProjectTask records from the CSV data
+        // 6. Create ProjectTask records from the CSV data
         
         // Get picklist values for validation
         List<Schema.PicklistEntry> typeEntries = JIP_ProjectTask__c.TaskType__c.getDescribe().getPicklistValues();
@@ -184,15 +174,19 @@ public class JIP_ProjectTaskImportQueueable implements Queueable{
             List<String> csvColumns = row.columns;
             System.debug('CSV Columns: ' + csvColumns);
             JIP_ProjectTask__c csvTask = new JIP_ProjectTask__c();
+            String subject = (csvColumns.size() > COL_SUBJECT && csvColumns[COL_SUBJECT] != null) ? csvColumns[COL_SUBJECT].trim() : '';
             if (csvColumns.size() != REQUIRED_HEADERS.size()) {
-                failImport(cv, 'Invalid number of columns at Row ' + row.lineNumber + '. Expected: ' + REQUIRED_HEADERS.size() + ', Found: ' + csvColumns.size());
-                continue;
+                errorCount++;
+                errorMessages.add('Row ' + row.lineNumber + 
+                    + (String.isNotBlank(subject)? ': ' + subject : '')
+                    + '\n Invalid number of columns. Expected: ' + REQUIRED_HEADERS.size() 
+                    + ', Found: ' + csvColumns.size());
+                continue; // Skip this row due to column mismatch
             } 
             
             List <String> rowErrors = new List<String>();
 
             //  Required: Subject column B
-            String subject = csvColumns[COL_SUBJECT] == null ? '' : csvColumns[COL_SUBJECT].trim();
             if (String.isBlank(subject)) {
                 rowErrors.add('Subject is required');
             }
@@ -226,7 +220,7 @@ public class JIP_ProjectTaskImportQueueable implements Queueable{
             if (!rowErrors.isEmpty()) {
                 errorCount++;
                 for (String error : rowErrors) {
-                    errorMessages.add('Row ' + row.lineNumber + ': ' + error);
+                    errorMessages.add('Row ' + row.lineNumber + ': ' + subject + '\n ' + error);
                 }
                 continue; // Skip this row due to errors
             }
@@ -249,23 +243,25 @@ public class JIP_ProjectTaskImportQueueable implements Queueable{
             }
         }
 
-        totalCount = tasksToInsert.size() + errorCount;
-        // 8. Insert the valid ProjectTask records and handle any DML exceptions
-        try {
-            Database.SaveResult[] results = Database.insert(tasksToInsert, true);
-            successCount = results.size();
-        }
-        catch (DmlException e) {
-            errorCount += e.getNumDml();
-            for (Integer i = 0; i < e.getNumDml(); i++) {
-                Integer errorIndex = e.getDmlIndex(i);
-                Integer lineNumber = taskLineNumbers[errorIndex];
-                String taskName = tasksToInsert[errorIndex].Subject__c;
-                String errorMessage = 'Row ' + lineNumber + ' (Task: ' + taskName + '): ' + e.getDmlMessage(i);
-                errorMessages.add(errorMessage);
+        totalCount = dataRows.size();
+        // 7. Insert the valid ProjectTask records and handle any DML exceptions
+        if (errorCount == 0) {
+            try {
+                Database.SaveResult[] results = Database.insert(tasksToInsert, true);
+                successCount = results.size();
+            } catch (DmlException e) {
+                errorCount += e.getNumDml();
+                for (Integer i = 0; i < e.getNumDml(); i++) {
+                    Integer errorIndex = e.getDmlIndex(i);
+                    Integer lineNumber = taskLineNumbers[errorIndex];
+                    String taskName = tasksToInsert[errorIndex].Subject__c;
+                    String errorMessage = 'Row ' + lineNumber + ': ' + taskName + '\n ' + e.getDmlMessage(i);
+                    errorMessages.add(errorMessage);
+                }
             }
         }
 
+        // 8. Send email notification to the user with the import results and any errors
         try {
             sendImportResultEmail(totalCount, successCount, errorCount, errorMessages);
         } finally {
@@ -367,6 +363,7 @@ public class JIP_ProjectTaskImportQueueable implements Queueable{
         return rows;
     }
 
+    // Check if a row is empty (all columns are blank)
     private static Boolean isEmptyRow(List<String> columns) {
         for (String c : columns) {
             if (String.isNotBlank(c)) return false;
@@ -374,14 +371,39 @@ public class JIP_ProjectTaskImportQueueable implements Queueable{
         return true;
     }
 
+    // Validate the CSV header against the required headers
     private static Boolean isValidHeader(List<String> csvHeader) {
         if (csvHeader == null || csvHeader.size() != REQUIRED_HEADERS.size()) return false;
         for (Integer i = 0; i < REQUIRED_HEADERS.size(); i++) {
-            String csvHeader = csvHeader[i] == null ? '' : csvHeader[i].trim();
             String v = csvHeader[i] == null ? '' : csvHeader[i].trim();
             if (v != REQUIRED_HEADERS[i]) return false;
         }
         return true;
+    }
+
+    // Parse Due Date from CSV and validate format
+    private static Date parseDueDate(String raw, List<String> rowErrors) {
+        String s = raw.trim();
+        // YYYY-MM-DD
+        if (!Pattern.matches('\\d{4}-\\d{2}-\\d{2}', s)) {
+            rowErrors.add('Invalid \'Due Date\' format (expected YYYY-MM-DD).');
+            return null;
+        }
+        try {
+            Date d = Date.valueOf(s);
+            // Kiểm tra chặt: Date.valueOf có thể chuẩn hóa ngày không tồn tại
+            Integer y = Integer.valueOf(s.substring(0, 4));
+            Integer m = Integer.valueOf(s.substring(5, 7));
+            Integer dd = Integer.valueOf(s.substring(8, 10));
+            if (d.year() != y || d.month() != m || d.day() != dd) {
+                rowErrors.add('\'Due Date\' does not exist (e.g., Feb 30).');
+                return null;
+            }
+            return d;
+        } catch (Exception e) {
+            rowErrors.add('Invalid \'Due Date\'.');
+            return null;
+        }
     }
 
     // Send email to user
@@ -390,7 +412,7 @@ public class JIP_ProjectTaskImportQueueable implements Queueable{
         Integer successCount,
         Integer errorCount,
         List<String> errorMessages
-    ){
+    ) {
         Messaging.SingleEmailMessage email = new Messaging.SingleEmailMessage();
 
         String baseUrl = URL.getOrgDomainUrl().toExternalForm();
@@ -539,7 +561,7 @@ public class JIP_ProjectTaskImportQueueable implements Queueable{
     }
 
     private void failImport(ContentVersion cv, String errorMessage) {
-        List<String> errorMessages = new List<String>();
+        List<String> errorMessages = new List<String>{errorMessage};
         try {
             sendImportResultEmail(0, 0, 1, errorMessages);
         }
